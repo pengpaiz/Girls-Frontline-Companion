@@ -10,16 +10,16 @@ class SettingsWindow(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("AuraPet 设置")
-        self.geometry("420x320")
         self.resizable(False, False)
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
+        # 窗口尺寸
+        w, h = 480, 420
         self.update_idletasks()
         sw = self.winfo_screenwidth()
         sh = self.winfo_screenheight()
-        w, h = 420, 320
         x = (sw - w) // 2
         y = (sh - h) // 2
         self.geometry(f"{w}x{h}+{x}+{y}")
@@ -66,7 +66,7 @@ class SettingsWindow(ctk.CTk):
         self.char_label.pack(side="left")
 
         self.char_dirs = self._scan_characters()
-        current_char = self.cfg.get('character', 'an94_images')
+        current_char = self.cfg.get('character', 'ar15')
         self.char_var = ctk.StringVar(value=current_char)
         self.char_menu = ctk.CTkOptionMenu(
             self.char_frame,
@@ -102,7 +102,7 @@ class SettingsWindow(ctk.CTk):
         self.close_btn.pack(pady=5)
 
     def _scan_characters(self):
-        """扫描 data/ 下所有子文件夹作为可选角色"""
+        """扫描 data/ 下所有子文件夹作为可选角色（必须有 wait/ 子目录且含 png）"""
         data_dir = os.path.join(CONFIG_DIR, 'data')
         if not os.path.isdir(data_dir):
             return []
@@ -110,12 +110,14 @@ class SettingsWindow(ctk.CTk):
         for name in sorted(os.listdir(data_dir)):
             full = os.path.join(data_dir, name)
             if os.path.isdir(full):
-                has_png = any(
-                    f.lower().endswith('.png')
-                    for f in os.listdir(full)
-                )
-                if has_png:
-                    dirs.append(name)
+                wait_dir = os.path.join(full, 'wait')
+                if os.path.isdir(wait_dir):
+                    has_png = any(
+                        f.lower().endswith('.png')
+                        for f in os.listdir(wait_dir)
+                    )
+                    if has_png:
+                        dirs.append(name)
         return dirs
 
     def _on_save(self):
@@ -135,7 +137,7 @@ class SettingsWindow(ctk.CTk):
         ))
 
     def _apply_auto_start(self):
-        """写入 / 删除 Windows 开机启动项"""
+        """写入 / 删除 Windows 开机启动项（.vbs 脚本，完全静默）"""
         import platform
         if platform.system() != 'Windows':
             return
@@ -144,34 +146,47 @@ class SettingsWindow(ctk.CTk):
             os.getenv('APPDATA', ''),
             r'Microsoft\Windows\Start Menu\Programs\Startup'
         )
-        shortcut_path = os.path.join(startup_dir, 'AuraPet.lnk')
+        vbs_path = os.path.join(startup_dir, 'AuraPet.vbs')
+
+        # 清理所有历史残留（.bat / .lnk）
+        for fname in ('AuraPet.bat', 'AuraPet.lnk'):
+            fp = os.path.join(startup_dir, fname)
+            try:
+                if os.path.isfile(fp):
+                    os.remove(fp)
+            except OSError:
+                pass
 
         if self.cfg['auto_start']:
             exe_path = self._get_exe_path()
+            # VBS 脚本：完全静默，无控制台窗口
+            vbs_content = (
+                'CreateObject("WScript.Shell").Run '
+                '"""{}""", 0, False'
+            ).format(exe_path)
             try:
-                import pythoncom
-                from win32com.client import Dispatch
-                pythoncom.CoInitialize()
-                shell = Dispatch('WScript.Shell')
-                shortcut = shell.CreateShortCut(shortcut_path)
-                shortcut.Targetpath = exe_path
-                shortcut.WorkingDirectory = os.path.dirname(exe_path)
-                shortcut.save()
-                pythoncom.CoUninitialize()
-            except ImportError:
+                with open(vbs_path, 'w', encoding='utf-8') as f:
+                    f.write(vbs_content)
+            except OSError:
                 pass
         else:
             try:
-                if os.path.isfile(shortcut_path):
-                    os.remove(shortcut_path)
+                if os.path.isfile(vbs_path):
+                    os.remove(vbs_path)
             except OSError:
                 pass
 
     def _get_exe_path(self):
         if getattr(sys, 'frozen', False):
-            return sys.executable
+            return os.path.abspath(sys.executable)
         else:
-            return sys.argv[0]
+            # 开发环境：指向项目 AuraPet.exe（打包后才有意义）
+            # 如果没打包，则指向 python.exe 启动脚本
+            exe = os.path.join(CONFIG_DIR, 'AuraPet.exe')
+            if os.path.isfile(exe):
+                return exe
+            # 回退：用 python 启动 main.py
+            return os.path.abspath(sys.argv[0])
 
     def _on_close(self):
         self.destroy()

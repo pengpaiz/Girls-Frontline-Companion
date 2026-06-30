@@ -2,4 +2,3 @@ PyQt5>=5.15
 PyQt5-Qt5>=5.15
 customtkinter>=6.0
 darkdetect>=0.8
-pywin32>=312
