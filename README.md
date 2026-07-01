@@ -31,6 +31,6 @@ AuraPet/
 ├── settings_ui.py   # 设置界面（CustomTkinter）
 ├── logo.ico         # 默认图标
 ├── data/            # 角色素材
-│   └── an94_images/ # AN-94 待机动画（54 帧）
+│   └── an94_images/ # 待机动画（54 帧）
 └── requirements.txt
 ```
