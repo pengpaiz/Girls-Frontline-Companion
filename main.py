@@ -1,7 +1,7 @@
-
-"""AuraPet — 桌面宠物主程序（PyQt5，懒加载优化版）"""
+"""AuraPet — 桌面宠物主程序（PyQt5，缓存优化版）"""
 
 import sys, os, glob, time
+from collections import OrderedDict
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLabel, QSystemTrayIcon, QMenu, QAction
 )
@@ -9,6 +9,44 @@ from PyQt5.QtCore import Qt, QSize, QPoint, QTimer, QRect
 from PyQt5.QtGui import QPixmap, QIcon, QPainter, QColor, QImage
 
 from config import load, save, CONFIG_DIR
+from logger import logger, perf_monitor
+
+# ─── 角色动画速度配置 ─────────────────────────
+# 每个角色可以配置不同动画的速度倍率（帧间隔除数）
+CHARACTER_ANIM_SPEED = {
+    'ar15': {
+        'move': 3.0,    # 移动动画 3x 速度
+        'click': 3.0,   # 点击动画 3x 速度
+    },
+    # 其他角色可以在这里添加配置
+}
+
+# ─── 图像缓存 ────────────────────────────
+class ImageCache:
+    """LRU 缓存，存储缩放后的 QPixmap"""
+    def __init__(self, max_size=100):
+        self._cache = OrderedDict()
+        self._max_size = max_size
+
+    def get(self, key):
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            return self._cache[key]
+        return None
+
+    def put(self, key, value):
+        if key in self._cache:
+            self._cache.move_to_end(key)
+        else:
+            if len(self._cache) >= self._max_size:
+                self._cache.popitem(last=False)
+        self._cache[key] = value
+
+    def clear(self):
+        self._cache.clear()
+
+# 全局缓存实例
+_image_cache = ImageCache(max_size=150)
 
 # ─── 路径工具 ────────────────────────────
 def _resolve_data_subdir(subfolder: str) -> str:
@@ -24,6 +62,7 @@ def _resolve_data_subdir(subfolder: str) -> str:
 
 
 def _sync_auto_start():
+    """同步开机自启动设置"""
     if sys.platform != 'win32':
         return
     sd = os.path.join(os.getenv('APPDATA', ''),
@@ -52,28 +91,34 @@ def _sync_auto_start():
                 os.makedirs(sd, exist_ok=True)
                 open(vbs, 'w', encoding='utf-8').write(
                     'CreateObject("WScript.Shell").Run """{}""", 0, False'.format(exe))
-            except OSError:
-                pass
+                logger.info(f'已创建开机自启动: {vbs}')
+            except OSError as e:
+                logger.error(f'创建开机自启动失败: {e}')
     else:
         if os.path.isfile(vbs):
             try:
                 os.remove(vbs)
-            except OSError:
-                pass
+                logger.info(f'已移除开机自启动: {vbs}')
+            except OSError as e:
+                logger.error(f'移除开机自启动失败: {e}')
 
 
 # ─── DesktopPet ───────────────────────────
 class DesktopPet(QWidget):
     PET_W, PET_H = 533, 400
     CLICK_CD = 30       # 点击动画冷却秒数
-    INTERVAL = 42       # 默认帧间隔 ms
-    CLICK_INTERVAL = 28 # 点击动画帧间隔 ms（加快 1/3）
+    BASE_INTERVAL = 66  # 基础帧间隔 ms（~15 FPS）
+    BASE_CLICK_INTERVAL = 50  # 基础点击动画帧间隔 ms
 
     def __init__(self, character='ar15', always_on_top=True,
                  saved_x=None, saved_y=None):
         super().__init__()
         self.character = character
         self.always_on_top = always_on_top
+        # 根据角色计算实际帧间隔
+        self.INTERVAL = self.BASE_INTERVAL
+        self.CLICK_INTERVAL = self._get_click_interval()
+        self.MOVE_INTERVAL = self._get_move_interval()
         # 只存文件路径，每帧按需加载（内存 ~10MB vs 原 ~200MB）
         self.wait_paths = []
         self.click_paths = []
@@ -83,8 +128,54 @@ class DesktopPet(QWidget):
         self._cd_timer = 0.0
         self._cd_active = False
         self._pre_cd_paths = []
+        self.after_click_paths = []
+        self._original_wait_paths = []  # 过渡前的原始 wait，供淡入淡出用
+        self._transition_phase = 0      # 0=无, 1=首轮after_click, 2=淡出, 3=淡入click, 4=淡入sit, 5=淡出sit
+        self._transition_idx = 0
+        self._transition_steps = 20     # 淡出帧数（减少，加快过渡）
+        self._transition_steps_in = 12  # 淡入帧数（减少，加快过渡）
+        self._transition_from_paths = [] # 过渡源路径
+        self._transition_from_idx = 0
+        self._sit_transition_from_paths = []  # 坐下过渡源路径
         self._hit_rect = None  # 非透明像素包围矩形
+        # ── 缓存（有上限，防止内存泄漏） ──────────────
+        self._canvas_cache = OrderedDict()   # 预渲染 canvas 缓存，上限 80 条
+        self._canvas_cache_max = 80
+        self._crossfade_cache = OrderedDict()  # crossfade 结果缓存，上限 60 条
+        self._crossfade_cache_max = 60
+        self._autosnap_counter = 0  # _auto_snap 节流计数器
+        # ── 自动散步 ──────────────────────────
+        self.move_paths = []
+        self._moving = False
+        self._move_target_x = 0
+        self._move_mirror = False
+        self._idle_frames = 0        # 空闲帧计数，用于触发散步
+        self._walk_interval = 90     # ~6s (90×66ms)，减少散步频率
+        self._move_loop_count = 0    # 当前已播放循环次数
+        self._move_max_loops = 0     # 本次散步最大循环次数
+        # ── 坐下模式 ──────────────────────────
+        self.sit_paths = []
+        self._sit_mode = False
+        self._sit_switch_time = 0.0  # 上次切换坐下的时间
+        # ── 动作冷却 ──────────────────────────
+        self._mode_switch_time = 0.0  # 上次模式切换时间（click/sit）
+        self._mode_cooldown = 5.0     # 模式切换后 5s 内不散步
         self.initUI(saved_x, saved_y)
+
+    def _get_anim_speed(self, anim_type: str) -> float:
+        """获取角色的动画速度倍率"""
+        char_config = CHARACTER_ANIM_SPEED.get(self.character, {})
+        return char_config.get(anim_type, 1.0)
+
+    def _get_click_interval(self) -> int:
+        """根据角色计算点击动画帧间隔（最低 33ms = 30FPS，避免抢占 CPU）"""
+        speed = self._get_anim_speed('click')
+        return max(33, int(self.BASE_CLICK_INTERVAL / speed))
+
+    def _get_move_interval(self) -> int:
+        """根据角色计算移动动画帧间隔（最低 33ms = 30FPS，避免抢占 CPU）"""
+        speed = self._get_anim_speed('move')
+        return max(33, int(self.BASE_INTERVAL / speed))
 
     def initUI(self, saved_x, saved_y):
         flags = Qt.FramelessWindowHint | Qt.SubWindow
@@ -97,6 +188,9 @@ class DesktopPet(QWidget):
         self.wait_paths = self._scan(os.path.join(d, 'wait'))
         self.click_paths = self._scan(os.path.join(d, 'click'))
         self.pick_paths = self._scan(os.path.join(d, 'pick'))
+        self.after_click_paths = self._scan(os.path.join(d, 'after_click'))
+        self.move_paths = self._scan(os.path.join(d, 'move'))
+        self.sit_paths = self._scan(os.path.join(d, 'sit'))
         if not self.wait_paths and self.click_paths:
             self.wait_paths = self.click_paths
         if not self.pick_paths:
@@ -133,61 +227,372 @@ class DesktopPet(QWidget):
     def _scan(self, folder):
         if not os.path.isdir(folder):
             return []
-        return sorted(glob.glob(os.path.join(folder, '*.png')))
+        files = sorted(glob.glob(os.path.join(folder, '*.png')))
+        if not files:
+            # 尝试扫描子目录
+            for sub in os.listdir(folder):
+                sub_path = os.path.join(folder, sub)
+                if os.path.isdir(sub_path):
+                    files = sorted(glob.glob(os.path.join(sub_path, '*.png')))
+                    if files:
+                        break
+        return files
 
-    def _load(self, path):
-        """加载单帧：缩放 → 画到固定画布 → 释放原图"""
-        src = QPixmap(path)
-        if src.isNull():
+    def _load(self, path, mirror=False):
+        """加载单帧：使用缓存避免重复缩放和渲染"""
+        cache_key = (path, mirror)
+
+        # 检查本地画布缓存（LRU: 命中时移到末尾）
+        if cache_key in self._canvas_cache:
+            self._canvas_cache.move_to_end(cache_key)
+            perf_monitor.record_cache_hit()
+            return self._canvas_cache[cache_key]
+
+        # 使用全局缓存获取缩放后的图像
+        scale_key = (path, self.PET_W, self.PET_H, mirror)
+        scaled = _image_cache.get(scale_key)
+
+        if scaled is None:
+            perf_monitor.record_cache_miss()
+            try:
+                if mirror:
+                    # 镜像模式：用 QImage 加载并镜像
+                    src = QImage(path)
+                    if src.isNull():
+                        logger.warning(f'图片加载失败: {path}')
+                        return None
+                    src = src.mirrored(True, False)
+                    scaled = src.scaled(QSize(self.PET_W, self.PET_H),
+                                        Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                else:
+                    # 正常模式：用 QPixmap 加载并缩放
+                    src = QPixmap(path)
+                    if src.isNull():
+                        logger.warning(f'图片加载失败: {path}')
+                        return None
+                    scaled = src.scaled(QSize(self.PET_W, self.PET_H),
+                                        Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                # 存入全局缓存
+                _image_cache.put(scale_key, scaled)
+            except Exception as e:
+                logger.error(f'图片处理错误 [{path}]: {e}', exc_info=True)
+                return None
+
+        # 渲染到固定画布
+        try:
+            canvas = QPixmap(self.PET_W, self.PET_H)
+            canvas.fill(QColor(0, 0, 0, 1))
+            p = QPainter(canvas)
+            if mirror:
+                p.drawImage((self.PET_W - scaled.width()) // 2,
+                            (self.PET_H - scaled.height()) // 2, scaled)
+            else:
+                p.drawPixmap((self.PET_W - scaled.width()) // 2,
+                             (self.PET_H - scaled.height()) // 2, scaled)
+            p.end()
+
+            # 存入本地缓存（LRU: 超限时淘汰最久未用）
+            if len(self._canvas_cache) >= self._canvas_cache_max:
+                self._canvas_cache.popitem(last=False)
+            self._canvas_cache[cache_key] = canvas
+            return canvas
+        except Exception as e:
+            logger.error(f'画布渲染错误 [{path}]: {e}', exc_info=True)
             return None
-        scaled = src.scaled(QSize(self.PET_W, self.PET_H),
-                            Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        canvas = QPixmap(self.PET_W, self.PET_H)
-        canvas.fill(QColor(0, 0, 0, 1))  # 1/255 alpha，肉眼不可见但 Windows 识别
-        p = QPainter(canvas)
-        p.drawPixmap((self.PET_W - scaled.width()) // 2,
-                     (self.PET_H - scaled.height()) // 2, scaled)
-        p.end()
-        return canvas
 
-    def _show(self, path):
-        pm = self._load(path)
+    def _show(self, path, mirror=False):
+        """显示单帧，使用缓存"""
+        pm = self._load(path, mirror)
         if pm:
             self.label.setPixmap(pm)
 
+    def _stop_moving(self):
+        """停止移动并恢复到等待状态"""
+        logger.debug(f'散步结束: 最终位置=({self.x()}, {self.y()})')
+        self._moving = False
+        self._idle_frames = 0
+        self.timer.setInterval(self.INTERVAL)
+        self.current_paths = self.wait_paths
+        self.current_idx = 0
+        self._show(self.current_paths[0])
+        self._save_pos()
+
     def next_frame(self):
+        """主帧更新循环"""
+        # 记录帧时间（性能监控）
+        perf_monitor.record_frame()
+
         if not self.current_paths:
             return
+
+        # ── Phase 4: 淡入 sit（进入坐下模式）──────
+        if self._transition_phase == 4:
+            self._transition_idx += 1
+            progress = min(self._transition_idx / self._transition_steps_in, 1.0)
+            from_path = self._sit_transition_from_paths[self._transition_from_idx % len(self._sit_transition_from_paths)]
+            self._transition_from_idx += 1
+            self._show_crossfade(from_path, self.sit_paths[0], progress)
+            if progress >= 1.0:
+                self._transition_phase = 0
+                self.current_paths = self.sit_paths
+                self.current_idx = 0
+            return
+
+        # ── Phase 5: 淡出 sit（退出坐下模式）──────
+        if self._transition_phase == 5:
+            self._transition_idx += 1
+            progress = min(self._transition_idx / self._transition_steps, 1.0)
+            sit_idx = self._transition_idx % len(self.sit_paths)
+            wait_idx = self._transition_idx % len(self.wait_paths)
+            self._show_crossfade(self.sit_paths[sit_idx], self.wait_paths[wait_idx], progress)
+            if progress >= 1.0:
+                self._transition_phase = 0
+                self._sit_mode = False
+                self.current_paths = self.wait_paths
+                self.current_idx = wait_idx
+                self._show(self.current_paths[self.current_idx])
+            return
+
+        # ── 坐下模式：固定播放 sit 动画 ──────────
+        if self._sit_mode:
+            self.current_idx = (self.current_idx + 1) % len(self.sit_paths)
+            self._show(self.sit_paths[self.current_idx])
+            return
+
+        # ── Phase 3: 淡入 click ─────────────────
+        if self._transition_phase == 3:
+            self._transition_idx += 1
+            progress = min(self._transition_idx / self._transition_steps_in, 1.0)
+            from_path = self._transition_from_paths[self._transition_from_idx]
+            self._transition_from_idx = (self._transition_from_idx + 1) % len(self._transition_from_paths)
+            self._show_crossfade(from_path, self.click_paths[0], progress)
+            if progress >= 1.0:
+                self._transition_phase = 0
+                self._cd_active = True
+                self._pre_cd_paths = self.wait_paths
+                self.current_paths = self.click_paths
+                self.current_idx = 0
+                self.timer.setInterval(self.CLICK_INTERVAL)
+            return
+
+        # ── 自动散步：移动中 ────────────────────
+        if self._moving:
+            if self.move_paths:
+                self.current_idx = (self.current_idx + 1) % len(self.move_paths)
+                if self.current_idx == 0:
+                    self._move_loop_count += 1
+                self._show(self.move_paths[self.current_idx], self._move_mirror)
+
+            # 循环次数达到上限，停止散步
+            if self._move_max_loops > 0 and self._move_loop_count >= self._move_max_loops:
+                self._stop_moving()
+                return
+
+            # 向目标移动
+            dx = self._move_target_x - self.x()
+            step = 4  # 每帧移动像素
+            if abs(dx) <= step:
+                # 到达目标，吸附边缘
+                self.move(self._move_target_x, self.y())
+                self._stop_moving()
+            else:
+                self.move(self.x() + (step if dx > 0 else -step), self.y())
+            return
+
+        # ── 非移动状态：正常帧动画 ──────────────
         self.current_idx = (self.current_idx + 1) % len(self.current_paths)
+
         if self.current_idx == 0 and self._cd_active:
             self._cd_active = False
-            self.current_paths = self._pre_cd_paths or self.wait_paths
             self.timer.setInterval(self.INTERVAL)
+            if self.after_click_paths:
+                self._original_wait_paths = self.wait_paths
+                self.wait_paths = self.after_click_paths
+                self._pre_cd_paths = []
+                self._transition_phase = 1
+            self.current_paths = self._pre_cd_paths or self.wait_paths
+            self.save_action_state()  # click 冷却结束，持久化当前状态
+
+        # ── 过渡状态机 ────────────────────────
+        if self._transition_phase == 1 and self.current_idx == 0:
+            if self._original_wait_paths:
+                self._transition_phase = 2
+                self._transition_idx = 0
+
+        if self._transition_phase == 2:
+            self._transition_idx += 1
+            progress = min(self._transition_idx / self._transition_steps, 1.0)
+            after_idx = self.current_idx % len(self.after_click_paths)
+            wait_idx = self.current_idx % len(self._original_wait_paths)
+            self._show_crossfade(
+                self.after_click_paths[after_idx],
+                self._original_wait_paths[wait_idx],
+                progress
+            )
+            if progress >= 1.0:
+                self._transition_phase = 0
+                self.wait_paths = self._original_wait_paths
+                self.current_paths = self.wait_paths
+                self.current_idx = wait_idx
+                self._show(self.current_paths[self.current_idx])
+            return
+
         self._show(self.current_paths[self.current_idx])
 
+        # ── 全局自动吸附（每 30 帧执行一次，减少系统调用）─────
+        self._autosnap_counter += 1
+        if self._autosnap_counter >= 30:
+            self._autosnap_counter = 0
+            self._auto_snap()
+
+        # ── 散步计时器 ─────────────────────────
+        self._idle_frames += 1
+        # 模式切换后 5s 内禁止散步（click/sit 切换）
+        mode_cooldown = time.time() - self._mode_switch_time < self._mode_cooldown
+        if (self._idle_frames >= self._walk_interval
+                and self.move_paths
+                and self._transition_phase == 0
+                and not self._cd_active
+                and not mode_cooldown):
+            self._start_walk()
+
+    def _start_walk(self):
+        """随机走向屏幕一侧"""
+        import random
+        screen = QApplication.primaryScreen()
+        a = screen.availableGeometry()
+        cur_x = self.x()
+
+        left_dist = cur_x - a.left()
+        right_dist = a.right() - self.PET_W - cur_x
+        min_walk = a.width() // 4  # 最短路程 = 屏幕宽度的1/4
+
+        # 选方向：优先选满足最短路程的方向
+        if left_dist >= min_walk and right_dist >= min_walk:
+            # 两个方向都满足，按距离加权随机
+            if random.random() < right_dist / (left_dist + right_dist + 1):
+                target_x = cur_x - min_walk
+                self._move_mirror = True
+            else:
+                target_x = cur_x + min_walk
+                self._move_mirror = False
+        elif left_dist >= min_walk:
+            target_x = cur_x - min_walk
+            self._move_mirror = True
+        elif right_dist >= min_walk:
+            target_x = cur_x + min_walk
+            self._move_mirror = False
+        else:
+            # 都不满足最短路程，走较远方向到边缘
+            if left_dist > right_dist:
+                target_x = a.left()
+                self._move_mirror = True
+            else:
+                target_x = a.right() - self.PET_W
+                self._move_mirror = False
+
+        self._move_target_x = target_x
+        self._moving = True
+        self._idle_frames = 0
+        self._move_loop_count = 0
+        self._move_max_loops = random.randint(8, 15)  # 减少循环次数
+        self.timer.setInterval(self.MOVE_INTERVAL)    # 使用角色特定的移动帧率
+        self.current_paths = self.move_paths
+        self.current_idx = 0
+        logger.debug(f'开始散步: 目标={target_x}, 循环次数={self._move_max_loops}')
+        self._show(self.move_paths[0], self._move_mirror)
+
+    def _show_crossfade(self, path_a, path_b, progress):
+        """progress: 0.0 = 纯 A, 1.0 = 纯 B，使用缓存优化"""
+        # 量化 progress 到离散步进，减少缓存条目
+        quantized_progress = round(progress * 20) / 20  # 20 个离散级别
+        cache_key = (path_a, path_b, quantized_progress)
+
+        # 检查缓存（LRU: 命中时移到末尾）
+        if cache_key in self._crossfade_cache:
+            self._crossfade_cache.move_to_end(cache_key)
+            self.label.setPixmap(self._crossfade_cache[cache_key])
+            return
+
+        # 加载图片（使用缓存的缩放版本）
+        src_a = self._load_scaled(path_a)
+        src_b = self._load_scaled(path_b)
+        if src_a is None or src_b is None:
+            return
+
+        # 渲染 crossfade
+        canvas = QPixmap(self.PET_W, self.PET_H)
+        canvas.fill(QColor(0, 0, 0, 1))
+        p = QPainter(canvas)
+        p.setOpacity(1.0 - progress)
+        p.drawPixmap((self.PET_W - src_a.width()) // 2,
+                     (self.PET_H - src_a.height()) // 2, src_a)
+        p.setOpacity(progress)
+        p.drawPixmap((self.PET_W - src_b.width()) // 2,
+                     (self.PET_H - src_b.height()) // 2, src_b)
+        p.end()
+
+        # 存入缓存（LRU: 超限时淘汰最久未用）
+        if len(self._crossfade_cache) >= self._crossfade_cache_max:
+            self._crossfade_cache.popitem(last=False)
+        self._crossfade_cache[cache_key] = canvas
+        self.label.setPixmap(canvas)
+
+    def _load_scaled(self, path):
+        """加载并缩放图片，使用全局缓存"""
+        scale_key = (path, self.PET_W, self.PET_H, False)
+        scaled = _image_cache.get(scale_key)
+
+        if scaled is None:
+            src = QPixmap(path)
+            if src.isNull():
+                return None
+            scaled = src.scaled(QSize(self.PET_W, self.PET_H),
+                                Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            _image_cache.put(scale_key, scaled)
+
+        return scaled
+
     def change_character(self, character):
+        """切换角色时清空缓存并重新计算帧间隔"""
+        logger.info(f'切换角色: {self.character} → {character}')
         self.character = character
+        # 重新计算帧间隔
+        self.INTERVAL = self.BASE_INTERVAL
+        self.CLICK_INTERVAL = self._get_click_interval()
+        self.MOVE_INTERVAL = self._get_move_interval()
+        logger.debug(f'帧间隔: base={self.INTERVAL}ms, click={self.CLICK_INTERVAL}ms, move={self.MOVE_INTERVAL}ms')
+        # 清空本地缓存
+        self._canvas_cache.clear()
+        self._crossfade_cache.clear()
         d = _resolve_data_subdir(character)
         self.click_paths = self._scan(os.path.join(d, 'click'))
         self.wait_paths = self._scan(os.path.join(d, 'wait'))
         self.pick_paths = self._scan(os.path.join(d, 'pick'))
+        self.after_click_paths = self._scan(os.path.join(d, 'after_click'))
+        self.move_paths = self._scan(os.path.join(d, 'move'))
+        self.sit_paths = self._scan(os.path.join(d, 'sit'))
+        logger.debug(f'加载动画: wait={len(self.wait_paths)}, click={len(self.click_paths)}, move={len(self.move_paths)}')
         if not self.wait_paths and self.click_paths:
             self.wait_paths = self.click_paths
         if not self.pick_paths:
             self.pick_paths = self.wait_paths or self.click_paths
         self._cd_active = False
+        self._sit_mode = False
+        self._transition_phase = 0
         self.current_paths = self.wait_paths
         self.current_idx = 0
         self._hit_rect = self._calc_union_hit_rect()
         if self.current_paths:
             self._show(self.current_paths[0])
+        self.save_action_state()  # 切换角色后重置并持久化状态
 
     def update_settings(self, always_on_top):
         if always_on_top == self.always_on_top:
             return
         self.always_on_top = always_on_top
         self.hide()
-        flags = Qt.FramelessWindowHint | Qt.SubWindow
+        flags = Qt.FramelessWindowHint | Qt.Subwindow
         if always_on_top:
             flags |= Qt.WindowStaysOnTopHint
         self.setWindowFlags(flags)
@@ -195,7 +600,7 @@ class DesktopPet(QWidget):
 
     # ── 鼠标 ────────────────────────────────
     def _calc_hit_rect(self, paths):
-        """扫描图片列表，找出所有非透明像素的包围矩形"""
+        """扫描图片列表，找出所有非透明像素的包围矩形（优化版）"""
         if not paths:
             return None
         # 用 QImage 加载源文件，保留 alpha 通道
@@ -206,27 +611,77 @@ class DesktopPet(QWidget):
         img = img.convertToFormat(QImage.Format_ARGB32)
         img = img.scaled(QSize(self.PET_W, self.PET_H),
                          Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        min_x, min_y = img.width(), img.height()
+
+        width, height = img.width(), img.height()
+        min_x, min_y = width, height
         max_x, max_y = -1, -1
-        for y in range(img.height()):
-            for x in range(img.width()):
-                if img.pixel(x, y) >> 24:  # 直接提取 alpha 通道
-                    if x < min_x: min_x = x
-                    if x > max_x: max_x = x
-                    if y < min_y: min_y = y
-                    if y > max_y: max_y = y
-        if max_x < 0:
+
+        # PyQt5 兼容方式：使用 bits() 并转换为 bytes
+        # 注意：PyQt5 的 constBits() 返回 sip.voidptr，需要特殊处理
+        ptr = img.bits()
+        ptr.setsize(height * img.bytesPerLine())
+        data = bytes(ptr.asstring())
+        bytes_per_line = img.bytesPerLine()
+
+        # 快速扫描：先找到上下边界，再找左右边界
+        # 从上往下扫描找 min_y
+        for y in range(height):
+            row_start = y * bytes_per_line
+            for x in range(width):
+                # ARGB32 格式：每个像素 4 字节，alpha 在第 3 字节（索引 3）
+                alpha = data[row_start + x * 4 + 3]
+                if alpha > 0:
+                    min_y = y
+                    break
+            if min_y < height:
+                break
+
+        # 从下往上扫描找 max_y
+        for y in range(height - 1, -1, -1):
+            row_start = y * bytes_per_line
+            for x in range(width):
+                alpha = data[row_start + x * 4 + 3]
+                if alpha > 0:
+                    max_y = y
+                    break
+            if max_y >= 0:
+                break
+
+        if max_y < 0:
             return None
+
+        # 从左往右扫描找 min_x
+        for x in range(width):
+            for y in range(min_y, max_y + 1):
+                row_start = y * bytes_per_line
+                alpha = data[row_start + x * 4 + 3]
+                if alpha > 0:
+                    min_x = x
+                    break
+            if min_x < width:
+                break
+
+        # 从右往左扫描找 max_x
+        for x in range(width - 1, -1, -1):
+            for y in range(min_y, max_y + 1):
+                row_start = y * bytes_per_line
+                alpha = data[row_start + x * 4 + 3]
+                if alpha > 0:
+                    max_x = x
+                    break
+            if max_x >= 0:
+                break
+
         # 加上居中偏移，映射到画布（widget）坐标
-        ox = (self.PET_W - img.width()) // 2
-        oy = (self.PET_H - img.height()) // 2
+        ox = (self.PET_W - width) // 2
+        oy = (self.PET_H - height) // 2
         return QRect(min_x + ox, min_y + oy,
                      max_x - min_x + 1, max_y - min_y + 1)
 
     def _calc_union_hit_rect(self):
-        """综合 wait/click/pick 所有动画的首帧，取并集包围矩形"""
+        """综合 wait/click/pick 所有动画首帧，取并集包围矩形"""
         rects = []
-        for paths in (self.wait_paths, self.click_paths, self.pick_paths):
+        for paths in (self.wait_paths, self.click_paths, self.pick_paths, self.after_click_paths, self.move_paths, self.sit_paths):
             r = self._calc_hit_rect(paths)
             if r:
                 rects.append(r)
@@ -239,6 +694,30 @@ class DesktopPet(QWidget):
         return union
 
     def mousePressEvent(self, event):
+        # 右键切换坐下模式（带过渡效果）
+        if event.button() == Qt.RightButton:
+            if self._hit_rect is None or not self._hit_rect.contains(event.pos()):
+                return
+            if self.sit_paths and self._transition_phase == 0:
+                self._sit_transition_from_paths = list(self.current_paths)
+                self._transition_from_idx = self.current_idx
+                self._transition_idx = 0
+                self._sit_switch_time = time.time()  # 记录切换时间
+                self._mode_switch_time = self._sit_switch_time  # 记录模式切换时间
+                if not self._sit_mode:
+                    # 进入坐下模式：淡入sit
+                    self._transition_phase = 4
+                    self._sit_mode = True
+                    self._moving = False
+                    self.save_action_state()  # 立即持久化
+                    logger.debug('进入坐下模式')
+                else:
+                    # 退出坐下模式：淡出sit到wait
+                    self._transition_phase = 5
+                    self.save_action_state()  # 立即持久化
+                    logger.debug('退出坐下模式')
+            return
+
         if event.button() != Qt.LeftButton:
             return
         # 必须成功计算出 hit rect 才允许操作
@@ -270,16 +749,19 @@ class DesktopPet(QWidget):
     def mouseReleaseEvent(self, event):
         if event.button() != Qt.LeftButton:
             return
-        # 框外点击不触发任何操作
         if self._hit_rect is None or not self._hit_rect.contains(event.pos()):
             return
+        was_moving = self._moving
         if getattr(self, '_drag', False):
+            self._moving = False  # 拖拽取消散步
             if self.wait_paths:
                 self.current_paths = self.wait_paths
                 self.current_idx = 0
                 self._show(self.current_paths[0])
+            self._snap_to_edge()  # 吸附边缘
         else:
-            self._try_click()
+            if not was_moving:    # 散步中忽略单击
+                self._try_click()
         self._save_pos()
         for a in ('_press', '_drag'):
             if hasattr(self, a):
@@ -290,12 +772,15 @@ class DesktopPet(QWidget):
         if now < self._cd_timer or not self.click_paths:
             return
         self._cd_timer = now + self.CLICK_CD
-        self._cd_active = True
-        self._pre_cd_paths = self.wait_paths
-        self.current_paths = self.click_paths
-        self.current_idx = 0
+        self._mode_switch_time = now  # 记录模式切换时间
+        # 保存当前 idle 帧作为淡入源
+        self._transition_from_paths = list(self.current_paths)
+        self._transition_from_idx = self.current_idx
+        self._transition_phase = 3    # 淡入 click
+        self._transition_idx = 0
         self.timer.setInterval(self.CLICK_INTERVAL)
-        self._show(self.current_paths[0])
+        self.save_action_state()  # 立即持久化 click 状态
+        logger.debug(f'点击动画触发，冷却 {self.CLICK_CD}s')
 
     def _save_pos(self):
         cfg = load()
@@ -303,52 +788,190 @@ class DesktopPet(QWidget):
         cfg['pos_y'] = self.y()
         save(cfg)
 
+    def _get_action_type(self) -> str:
+        """获取当前动作类型（用于持久化）"""
+        if self._transition_phase == 5:
+            # Phase 5: 正在退出 sit 模式 → 视为 wait
+            return 'wait'
+        if self._sit_mode or self._transition_phase == 4:
+            return 'sit'
+        if self._cd_active or self._transition_phase in (1, 2, 3):
+            return 'click'
+        return 'wait'
+
+    def save_action_state(self):
+        """保存当前动作状态到配置文件"""
+        try:
+            cfg = load()
+            action_type = self._get_action_type()
+            if cfg.get('action_type') != action_type:
+                cfg['action_type'] = action_type
+                save(cfg)
+            logger.debug(f'保存动作状态: {action_type}')
+        except Exception as e:
+            logger.error(f'保存动作状态失败: {e}', exc_info=True)
+
+    def restore_action_state(self, action_type: str):
+        """恢复上次的动作状态（启动时调用）"""
+        if action_type == 'sit':
+            if self.sit_paths:
+                self._sit_mode = True
+                self.current_paths = self.sit_paths
+                self.current_idx = 0
+                self._show(self.current_paths[0])
+                logger.info('恢复坐下模式')
+            else:
+                logger.warning('无法恢复坐下模式：无 sit 动画资源')
+        elif action_type == 'click':
+            if self.click_paths:
+                self._try_click()
+                logger.info('恢复点击模式')
+            else:
+                logger.warning('无法恢复点击模式：无 click 动画资源')
+        else:
+            logger.debug('动作状态为 wait，无需恢复')
+
+    def _snap_to_edge(self):
+        """吸附到最近的屏幕边缘（含任务栏）"""
+        screen = QApplication.primaryScreen()
+        a = screen.availableGeometry()
+        snap = 40  # 吸附阈值（像素）
+        x, y = self.x(), self.y()
+
+        # X 轴吸附
+        if abs(x - a.left()) < snap:
+            x = a.left()
+        elif abs(x - (a.right() - self.PET_W)) < snap:
+            x = a.right() - self.PET_W
+
+        # Y 轴吸附
+        if abs(y - a.top()) < snap:
+            y = a.top()
+        elif abs(y - (a.bottom() - self.PET_H)) < snap:
+            y = a.bottom() - self.PET_H
+
+        self.move(x, y)
+
+    def _auto_snap(self):
+        """全局自动吸附：仅在wait状态且空闲时靠近边缘自动吸附"""
+        # 只在wait状态时吸附
+        if self.current_paths != self.wait_paths:
+            return
+        if self._moving or self._transition_phase != 0 or self._sit_mode:
+            return
+        if getattr(self, '_drag', False):  # 拖动中不吸附
+            return
+        screen = QApplication.primaryScreen()
+        a = screen.availableGeometry()
+        snap = 30  # 自动吸附阈值（像素）
+        x, y = self.x(), self.y()
+        moved = False
+
+        # X 轴自动吸附
+        if abs(x - a.left()) < snap and x != a.left():
+            x = a.left()
+            moved = True
+        elif abs(x - (a.right() - self.PET_W)) < snap and x != a.right() - self.PET_W:
+            x = a.right() - self.PET_W
+            moved = True
+
+        # Y 轴自动吸附（底部任务栏）
+        if abs(y - a.top()) < snap and y != a.top():
+            y = a.top()
+            moved = True
+        elif abs(y - (a.bottom() - self.PET_H)) < snap and y != a.bottom() - self.PET_H:
+            y = a.bottom() - self.PET_H
+            moved = True
+
+        if moved:
+            self.move(x, y)
+            self._save_pos()
+
+    def closeEvent(self, event):
+        """窗口关闭时保存位置 + 动作状态（合并为单次写入）"""
+        try:
+            cfg = load()
+            cfg['pos_x'] = self.x()
+            cfg['pos_y'] = self.y()
+            cfg['action_type'] = self._get_action_type()
+            save(cfg)
+            logger.info(f'程序关闭，已保存状态: pos=({self.x()},{self.y()}), action={cfg["action_type"]}')
+        except Exception as e:
+            logger.error(f'关闭时保存状态失败: {e}', exc_info=True)
+        super().closeEvent(event)
+
 
 # ─── 应用入口 ─────────────────────────────
 def main():
-    _sync_auto_start()
-    cfg = load()
-    app = QApplication(sys.argv)
-    app.setQuitOnLastWindowClosed(False)
+    try:
+        logger.info('程序启动中...')
+        _sync_auto_start()
+        cfg = load()
+        logger.info(f'配置加载成功: character={cfg.get("character")}, always_on_top={cfg.get("always_on_top")}')
 
-    logo = os.path.join(CONFIG_DIR, 'logo.ico')
-    if os.path.isfile(logo):
-        app.setWindowIcon(QIcon(logo))
+        app = QApplication(sys.argv)
+        app.setQuitOnLastWindowClosed(False)
 
-    pet = DesktopPet(cfg.get('character', 'an94'),
-                     cfg.get('always_on_top', True),
-                     cfg.get('pos_x'), cfg.get('pos_y'))
-    pet.show()
+        logo = os.path.join(CONFIG_DIR, 'logo.ico')
+        if os.path.isfile(logo):
+            app.setWindowIcon(QIcon(logo))
 
-    logo = os.path.join(CONFIG_DIR, 'logo.ico')
-    if os.path.isfile(logo):
-        # 托盘图标放大 3 倍：用 QPixmap 加载后缩放
-        pm = QPixmap(logo)
-        if not pm.isNull():
-            big = pm.scaled(48, 48, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            tray = QSystemTrayIcon(QIcon(big))
+        pet = DesktopPet(cfg.get('character', 'an94'),
+                         cfg.get('always_on_top', True),
+                         cfg.get('pos_x'), cfg.get('pos_y'))
+        pet.show()
+        logger.info('桌面宠物窗口已显示')
+
+        # 恢复上次的动作状态
+        action_type = cfg.get('action_type', 'wait')
+        logger.info(f'上次动作状态: {action_type}')
+        if action_type != 'wait':
+            pet.restore_action_state(action_type)
+
+        logo = os.path.join(CONFIG_DIR, 'logo.ico')
+        if os.path.isfile(logo):
+            # 托盘图标放大 3 倍：用 QPixmap 加载后缩放
+            pm = QPixmap(logo)
+            if not pm.isNull():
+                big = pm.scaled(48, 48, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                tray = QSystemTrayIcon(QIcon(big))
+            else:
+                tray = QSystemTrayIcon(QIcon(logo))
+        elif pet.current_paths:
+            tray = QSystemTrayIcon(QIcon(pet._load(pet.current_paths[0])))
         else:
-            tray = QSystemTrayIcon(QIcon(logo))
-    elif pet.current_paths:
-        tray = QSystemTrayIcon(QIcon(pet._load(pet.current_paths[0])))
-    else:
-        tray = QSystemTrayIcon()
+            tray = QSystemTrayIcon()
 
-    tray.setToolTip("AuraPet")
-    menu = QMenu()
-    a1 = QAction("⚙  设置", menu)
-    a1.triggered.connect(lambda: open_settings(pet, tray))
-    menu.addAction(a1)
-    menu.addSeparator()
-    a2 = QAction("⏻  退出", menu)
-    a2.triggered.connect(lambda: (tray.hide(), pet.close(), app.quit()))
-    menu.addAction(a2)
-    tray.setContextMenu(menu)
-    tray.activated.connect(
-        lambda r: open_settings(pet, tray) if r == QSystemTrayIcon.DoubleClick else None)
-    tray.show()
+        tray.setToolTip("AuraPet")
+        menu = QMenu()
+        a1 = QAction("⚙  设置", menu)
+        a1.triggered.connect(lambda: open_settings(pet, tray))
+        menu.addAction(a1)
 
-    app.exec_()
+        # 添加性能统计菜单项
+        a_perf = QAction("📊  性能统计", menu)
+        a_perf.triggered.connect(lambda: logger.log_performance())
+        menu.addAction(a_perf)
+
+        menu.addSeparator()
+        a2 = QAction("⏻  退出", menu)
+        a2.triggered.connect(lambda: (logger.info('用户退出程序'), pet.save_action_state(), tray.hide(), pet.close(), app.quit()))
+        menu.addAction(a2)
+        tray.setContextMenu(menu)
+        tray.activated.connect(
+            lambda r: open_settings(pet, tray) if r == QSystemTrayIcon.DoubleClick else None)
+        tray.show()
+        logger.info('系统托盘图标已显示，程序就绪')
+
+        # 每 5 分钟记录一次性能统计
+        perf_timer = QTimer()
+        perf_timer.timeout.connect(lambda: logger.log_performance())
+        perf_timer.start(5 * 60 * 1000)  # 5 分钟
+
+        app.exec_()
+    except Exception as e:
+        logger.critical(f'程序启动失败: {e}', exc_info=True)
+        raise
 
 
 def open_settings(pet, tray):

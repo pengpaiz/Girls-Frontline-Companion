@@ -27,6 +27,7 @@ DEFAULTS = {
     'always_on_top': True,
     'pos_x': None,
     'pos_y': None,
+    'action_type': 'wait',  # 保存退出时的动作类型：wait, sit, click
 }
 
 
