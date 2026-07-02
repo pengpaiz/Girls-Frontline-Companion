@@ -1,11 +1,11 @@
 """AuraPet — 桌面宠物主程序（PyQt5，缓存优化版）"""
 
-import sys, os, glob, time
+import sys, os, glob, time, gc
 from collections import OrderedDict
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLabel, QSystemTrayIcon, QMenu, QAction
 )
-from PyQt5.QtCore import Qt, QSize, QPoint, QTimer, QRect
+from PyQt5.QtCore import Qt, QSize, QPoint, QTimer, QRect, QThread, pyqtSignal
 from PyQt5.QtGui import QPixmap, QIcon, QPainter, QColor, QImage
 
 from config import load, save, CONFIG_DIR
@@ -62,45 +62,110 @@ def _resolve_data_subdir(subfolder: str) -> str:
 
 
 def _sync_auto_start():
-    """同步开机自启动设置"""
+    """同步开机自启动设置
+
+    方案：VBS 静默脚本放 CONFIG_DIR（不受杀软拦截），
+    仅在 Startup 文件夹放一个 .lnk 快捷方式指向 VBS。
+    始终清理注册表旧条目，避免重复自启动。
+    """
     if sys.platform != 'win32':
         return
+    import winreg
+
+    REG_KEY = r'Software\Microsoft\Windows\CurrentVersion\Run'
+    REG_NAME = 'AuraPet'
+
     sd = os.path.join(os.getenv('APPDATA', ''),
                       r'Microsoft\Windows\Start Menu\Programs\Startup')
-    vbs = os.path.join(sd, 'AuraPet.vbs')
-    for f in ('AuraPet.bat', 'AuraPet.lnk'):
-        try:
-            fp = os.path.join(sd, f)
-            if os.path.isfile(fp):
-                os.remove(fp)
-        except OSError:
-            pass
+
     cfg = load()
     exe = os.path.abspath(sys.executable) if getattr(sys, 'frozen', False) \
         else os.path.join(CONFIG_DIR, 'AuraPet.exe')
-    if cfg.get('auto_start'):
-        need = True
-        if os.path.isfile(vbs):
+
+    # ── 1. 清理注册表旧条目（防止与快捷方式重复） ───────
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_KEY,
+                             access=winreg.KEY_WRITE)
+        try:
+            winreg.DeleteValue(key, REG_NAME)
+            logger.info('已清理注册表旧自启动项')
+        except FileNotFoundError:
+            pass
+        winreg.CloseKey(key)
+    except OSError as e:
+        logger.debug(f'清理注册表跳过: {e}')
+
+    # ── 2. 清理 Startup 文件夹内历史残留文件 ──────────
+    for fname in os.listdir(sd) if os.path.isdir(sd) else []:
+        if fname.lower() in ('aurapet.vbs', 'aurapet.bat'):
             try:
-                if os.path.abspath(exe) in open(vbs, encoding='utf-8').read():
-                    need = False
+                os.remove(os.path.join(sd, fname))
             except OSError:
                 pass
-        if need:
-            try:
-                os.makedirs(sd, exist_ok=True)
-                open(vbs, 'w', encoding='utf-8').write(
-                    'CreateObject("WScript.Shell").Run """{}""", 0, False'.format(exe))
-                logger.info(f'已创建开机自启动: {vbs}')
-            except OSError as e:
-                logger.error(f'创建开机自启动失败: {e}')
-    else:
-        if os.path.isfile(vbs):
-            try:
-                os.remove(vbs)
-                logger.info(f'已移除开机自启动: {vbs}')
-            except OSError as e:
-                logger.error(f'移除开机自启动失败: {e}')
+
+    if not cfg.get('auto_start'):
+        # 关闭自启动：删除快捷方式
+        try:
+            lnk = os.path.join(sd, 'AuraPet.lnk')
+            if os.path.isfile(lnk):
+                os.remove(lnk)
+                logger.info('已移除开机自启动')
+        except OSError as e:
+            logger.error(f'移除开机自启动失败: {e}')
+        return
+
+    # ── 3. 在 CONFIG_DIR 写入 VBS 静默启动脚本 ────────
+    vbs_path = os.path.join(CONFIG_DIR, 'AuraPet.vbs')
+    try:
+        with open(vbs_path, 'w', encoding='utf-8') as f:
+            f.write(
+                'WScript.Sleep 5000\n'
+                'CreateObject("WScript.Shell").Run """{}""", 0, False'.format(exe))
+    except OSError as e:
+        logger.error(f'创建 VBS 失败: {e}')
+        return
+
+    # ── 4. 在 Startup 文件夹创建指向 VBS 的快捷方式 ────
+    lnk_path = os.path.join(sd, 'AuraPet.lnk')
+    try:
+        import win32com.client
+        shell = win32com.client.Dispatch('WScript.Shell')
+        sc = shell.CreateShortCut(lnk_path)
+        sc.TargetPath = vbs_path
+        sc.WorkingDirectory = CONFIG_DIR
+        sc.WindowStyle = 7  # 最小化启动 WScript
+        sc.save()
+        logger.info(f'已创建开机自启动快捷方式: {lnk_path} → {vbs_path}')
+    except Exception as e:
+        logger.error(f'创建快捷方式失败: {e}')
+
+
+# ─── 后台预加载工作线程 ──────────────────
+# 使用 QImage 做缩放（线程安全），主线程收到结果后再转 QPixmap 显示
+class PreloadWorker(QThread):
+    """后台缩放图片，finished 信号发射 {path: QImage} 字典（线程安全）"""
+    progress = pyqtSignal(int)        # 已完成帧数
+    finished = pyqtSignal(object)     # {path: QImage}
+
+    def __init__(self, paths, width, height, parent=None):
+        super().__init__(parent)
+        self._paths = list(paths)
+        self._w = width
+        self._h = height
+
+    def run(self):
+        result = {}
+        size = QSize(self._w, self._h)
+        total = len(self._paths)
+        for i, path in enumerate(self._paths):
+            img = QImage(path)
+            if not img.isNull():
+                result[path] = img.scaled(
+                    size, Qt.KeepAspectRatio, Qt.SmoothTransformation
+                )
+            if i % 10 == 0:
+                self.progress.emit(i)
+        self.finished.emit(result)
 
 
 # ─── DesktopPet ───────────────────────────
@@ -143,7 +208,24 @@ class DesktopPet(QWidget):
         self._canvas_cache_max = 80
         self._crossfade_cache = OrderedDict()  # crossfade 结果缓存，上限 60 条
         self._crossfade_cache_max = 60
+        self._hot_frames = {}  # path -> QImage/QPixmap（已缩放），当前模式帧常驻内存
+        self._last_shown_key = None  # (path, mirror) 上一次显示的帧，用于跳过冗余 setPixmap
         self._autosnap_counter = 0  # _auto_snap 节流计数器
+        # ── 复用画布（减少 QPainter 创建和 GC 压力） ────────
+        self._canvas = None           # _load 复用的持久 QPixmap
+        self._crossfade_canvas = None # _show_crossfade 复用的持久 QPixmap
+        # ── 后台预加载 ──────────────────────────────────────
+        self._preload_thread = None
+        self._preload_pending_paths = []
+        # ── 位置保存防抖 ────────────────────────
+        self._save_timer = QTimer()
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(1000)  # 1 秒防抖
+        self._save_timer.timeout.connect(self._do_save)
+        self._pos_dirty = False
+        self._action_dirty = False
+        # ── 拖拽节流 ────────────────────────────
+        self._last_move_time = 0.0
         # ── 自动散步 ──────────────────────────
         self.move_paths = []
         self._moving = False
@@ -178,7 +260,7 @@ class DesktopPet(QWidget):
         return max(33, int(self.BASE_INTERVAL / speed))
 
     def initUI(self, saved_x, saved_y):
-        flags = Qt.FramelessWindowHint | Qt.SubWindow
+        flags = Qt.FramelessWindowHint | Qt.Tool
         if self.always_on_top:
             flags |= Qt.WindowStaysOnTopHint
         self.setWindowFlags(flags)
@@ -224,6 +306,10 @@ class DesktopPet(QWidget):
         self.timer.setInterval(self.INTERVAL)
         self.timer.start()
 
+        # 预加载基础动画帧到内存（消除运行时的磁盘 I/O）
+        # 合并为一次调用，避免第二次调用取消第一次的后台任务
+        self._preload_paths(self.wait_paths + [p for p in self.click_paths if p not in self.wait_paths])
+
     def _scan(self, folder):
         if not os.path.isdir(folder):
             return []
@@ -238,6 +324,68 @@ class DesktopPet(QWidget):
                         break
         return files
 
+    def _preload_paths(self, paths: list):
+        """异步预加载一组动画帧到 _hot_frames（QThread 后台缩放，不阻塞 UI）
+
+        若帧已在 _hot_frames 中（QPixmap 类型）则跳过；
+        若已有预加载任务在跑则取消旧任务、启动新任务。
+        """
+        if not paths:
+            return
+        # 所有帧已就绪（Pixmap 类型） → 无需重做
+        if all(p in self._hot_frames and not isinstance(self._hot_frames[p], QImage)
+               for p in paths):
+            return
+        # 取消正在进行的预加载
+        if self._preload_thread is not None and self._preload_thread.isRunning():
+            try:
+                self._preload_thread.finished.disconnect(self._on_preload_done)
+            except TypeError:
+                pass
+            self._preload_thread.quit()
+            self._preload_thread.wait()
+            self._preload_thread = None
+        self._preload_pending_paths = list(paths)
+        worker = PreloadWorker(paths, self.PET_W, self.PET_H)
+        worker.finished.connect(self._on_preload_done)
+        self._preload_thread = worker
+        worker.start()
+        logger.debug(f'后台预加载已启动: {len(paths)} 帧')
+
+    def _on_preload_done(self, result: dict):
+        """后台预加载完成回调（主线程执行），将 QImage 结果写入 _hot_frames"""
+        self._hot_frames.update(result)
+        self._preload_pending_paths.clear()
+        self._preload_thread = None
+        logger.debug(f'后台预加载完成: {len(result)} 帧已写入热缓存')
+
+    def trim_hot_frames(self):
+        """模式切换时清理非当前动画帧的 _hot_frames，释放内存并触发 GC"""
+        active = set()
+        for paths in (self.wait_paths, self.click_paths, self.move_paths,
+                      self.sit_paths, self.pick_paths, self.after_click_paths,
+                      self.current_paths):
+            active.update(paths)
+        if self._transition_phase in (1, 2):
+            active.update(self._original_wait_paths)
+            active.update(self.after_click_paths)
+        if self._transition_phase == 3:
+            active.update(self._transition_from_paths)
+            active.update(self.click_paths)
+        if self._transition_phase == 4:
+            active.update(self._sit_transition_from_paths)
+            active.update(self.sit_paths)
+        if self._transition_phase == 5:
+            active.update(self.sit_paths)
+            active.update(self.wait_paths)
+        stale = [k for k in self._hot_frames if k not in active]
+        if not stale:
+            return
+        for k in stale:
+            del self._hot_frames[k]
+        logger.debug(f'修剪热缓存: 移除 {len(stale)} 帧，保留 {len(self._hot_frames)} 帧')
+        gc.collect()
+
     def _load(self, path, mirror=False):
         """加载单帧：使用缓存避免重复缩放和渲染"""
         cache_key = (path, mirror)
@@ -248,63 +396,80 @@ class DesktopPet(QWidget):
             perf_monitor.record_cache_hit()
             return self._canvas_cache[cache_key]
 
-        # 使用全局缓存获取缩放后的图像
-        scale_key = (path, self.PET_W, self.PET_H, mirror)
-        scaled = _image_cache.get(scale_key)
+        # 优先查热缓存（预加载的帧，零磁盘 I/O）
+        # 后台预加载返回 QImage（线程安全），首次使用时转 QPixmap 并回写缓存
+        hot = self._hot_frames.get(path)
+        if hot is not None:
+            if isinstance(hot, QImage):
+                hot = QPixmap.fromImage(hot)
+                self._hot_frames[path] = hot       # 回写，后续调用直接命中 QPixmap
+            scaled = hot.toImage().mirrored(True, False) if mirror else hot
+        else:
+            # 热缓存未命中，走全局 LRU 缓存 → 磁盘
+            scale_key = (path, self.PET_W, self.PET_H, mirror)
+            scaled = _image_cache.get(scale_key)
 
-        if scaled is None:
-            perf_monitor.record_cache_miss()
-            try:
-                if mirror:
-                    # 镜像模式：用 QImage 加载并镜像
-                    src = QImage(path)
-                    if src.isNull():
-                        logger.warning(f'图片加载失败: {path}')
-                        return None
-                    src = src.mirrored(True, False)
-                    scaled = src.scaled(QSize(self.PET_W, self.PET_H),
-                                        Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                else:
-                    # 正常模式：用 QPixmap 加载并缩放
-                    src = QPixmap(path)
-                    if src.isNull():
-                        logger.warning(f'图片加载失败: {path}')
-                        return None
-                    scaled = src.scaled(QSize(self.PET_W, self.PET_H),
-                                        Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                # 存入全局缓存
-                _image_cache.put(scale_key, scaled)
-            except Exception as e:
-                logger.error(f'图片处理错误 [{path}]: {e}', exc_info=True)
-                return None
+            if scaled is None:
+                perf_monitor.record_cache_miss()
+                try:
+                    if mirror:
+                        src = QImage(path)
+                        if src.isNull():
+                            logger.warning(f'图片加载失败: {path}')
+                            return None
+                        src = src.mirrored(True, False)
+                        scaled = src.scaled(QSize(self.PET_W, self.PET_H),
+                                            Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    else:
+                        src = QPixmap(path)
+                        if src.isNull():
+                            logger.warning(f'图片加载失败: {path}')
+                            return None
+                        scaled = src.scaled(QSize(self.PET_W, self.PET_H),
+                                            Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    _image_cache.put(scale_key, scaled)
+                except Exception as e:
+                    logger.error(f'图片处理错误 [{path}]: {e}', exc_info=True)
+                    return None
 
-        # 渲染到固定画布
+        # 兜底：任何 QImage 类型统一转为 QPixmap
+        if isinstance(scaled, QImage):
+            scaled = QPixmap.fromImage(scaled)
+
+        # 渲染到复用画布（self._canvas 避免每帧 new QPixmap + QPainter + GC）
         try:
-            canvas = QPixmap(self.PET_W, self.PET_H)
-            canvas.fill(QColor(0, 0, 0, 1))
-            p = QPainter(canvas)
-            if mirror:
-                p.drawImage((self.PET_W - scaled.width()) // 2,
-                            (self.PET_H - scaled.height()) // 2, scaled)
-            else:
+            if self._canvas is None:
+                self._canvas = QPixmap(self.PET_W, self.PET_H)
+            self._canvas.fill(QColor(0, 0, 0, 1))
+            p = QPainter(self._canvas)
+            try:
                 p.drawPixmap((self.PET_W - scaled.width()) // 2,
                              (self.PET_H - scaled.height()) // 2, scaled)
-            p.end()
+            finally:
+                p.end()
 
-            # 存入本地缓存（LRU: 超限时淘汰最久未用）
+            # 缓存 copy()：防止下一次 fill/draw 污染已缓存的帧
+            cached = self._canvas.copy()
+
+            # 存入本地缓存（LRU: 超限时淘汰最久未用，并触发 GC 释放显存）
             if len(self._canvas_cache) >= self._canvas_cache_max:
                 self._canvas_cache.popitem(last=False)
-            self._canvas_cache[cache_key] = canvas
-            return canvas
+                gc.collect()
+            self._canvas_cache[cache_key] = cached
+            return cached
         except Exception as e:
             logger.error(f'画布渲染错误 [{path}]: {e}', exc_info=True)
             return None
 
     def _show(self, path, mirror=False):
-        """显示单帧，使用缓存"""
+        """显示单帧，使用缓存 + 帧去重（画面未变则跳过 setPixmap，降低 DWM 合成压力）"""
+        show_key = (path, mirror)
+        if show_key == self._last_shown_key:
+            return  # 画面完全相同，跳过重绘
         pm = self._load(path, mirror)
         if pm:
             self.label.setPixmap(pm)
+            self._last_shown_key = show_key
 
     def _stop_moving(self):
         """停止移动并恢复到等待状态"""
@@ -316,6 +481,7 @@ class DesktopPet(QWidget):
         self.current_idx = 0
         self._show(self.current_paths[0])
         self._save_pos()
+        self.trim_hot_frames()  # 散步结束，清理 move 帧释放内存
 
     def next_frame(self):
         """主帧更新循环"""
@@ -458,6 +624,7 @@ class DesktopPet(QWidget):
 
     def _start_walk(self):
         """随机走向屏幕一侧"""
+        self._preload_paths(self.move_paths)  # 确保 move 帧在内存中
         import random
         screen = QApplication.primaryScreen()
         a = screen.availableGeometry()
@@ -520,23 +687,30 @@ class DesktopPet(QWidget):
         if src_a is None or src_b is None:
             return
 
-        # 渲染 crossfade
-        canvas = QPixmap(self.PET_W, self.PET_H)
-        canvas.fill(QColor(0, 0, 0, 1))
-        p = QPainter(canvas)
-        p.setOpacity(1.0 - progress)
-        p.drawPixmap((self.PET_W - src_a.width()) // 2,
-                     (self.PET_H - src_a.height()) // 2, src_a)
-        p.setOpacity(progress)
-        p.drawPixmap((self.PET_W - src_b.width()) // 2,
-                     (self.PET_H - src_b.height()) // 2, src_b)
-        p.end()
+        # 渲染 crossfade（复用 self._crossfade_canvas 避免反复分配）
+        if self._crossfade_canvas is None:
+            self._crossfade_canvas = QPixmap(self.PET_W, self.PET_H)
+        self._crossfade_canvas.fill(QColor(0, 0, 0, 1))
+        p = QPainter(self._crossfade_canvas)
+        try:
+            p.setOpacity(1.0 - progress)
+            p.drawPixmap((self.PET_W - src_a.width()) // 2,
+                         (self._crossfade_canvas.height() - src_a.height()) // 2, src_a)
+            p.setOpacity(progress)
+            p.drawPixmap((self.PET_W - src_b.width()) // 2,
+                         (self._crossfade_canvas.height() - src_b.height()) // 2, src_b)
+        finally:
+            p.end()
 
-        # 存入缓存（LRU: 超限时淘汰最久未用）
+        # 缓存 copy()：防止下次 fill/draw 污染已缓存帧
+        cached = self._crossfade_canvas.copy()
+        # 存入缓存（LRU: 超限时淘汰最久未用，并触发 GC 释放显存）
         if len(self._crossfade_cache) >= self._crossfade_cache_max:
             self._crossfade_cache.popitem(last=False)
-        self._crossfade_cache[cache_key] = canvas
-        self.label.setPixmap(canvas)
+            gc.collect()
+        self._crossfade_cache[cache_key] = cached
+        self.label.setPixmap(cached)
+        self._last_shown_key = None  # crossfade 是混合帧，重置去重标记
 
     def _load_scaled(self, path):
         """加载并缩放图片，使用全局缓存"""
@@ -562,9 +736,23 @@ class DesktopPet(QWidget):
         self.CLICK_INTERVAL = self._get_click_interval()
         self.MOVE_INTERVAL = self._get_move_interval()
         logger.debug(f'帧间隔: base={self.INTERVAL}ms, click={self.CLICK_INTERVAL}ms, move={self.MOVE_INTERVAL}ms')
-        # 清空本地缓存
+        # 取消正在进行的后台预加载
+        if self._preload_thread is not None and self._preload_thread.isRunning():
+            try:
+                self._preload_thread.finished.disconnect(self._on_preload_done)
+            except TypeError:
+                pass
+            self._preload_thread.quit()
+            self._preload_thread.wait()
+            self._preload_thread = None
+        # 清空本地缓存 + 复用画布，并触发 GC 释放显存
         self._canvas_cache.clear()
         self._crossfade_cache.clear()
+        self._hot_frames.clear()
+        self._canvas = None
+        self._crossfade_canvas = None
+        self._last_shown_key = None
+        gc.collect()
         d = _resolve_data_subdir(character)
         self.click_paths = self._scan(os.path.join(d, 'click'))
         self.wait_paths = self._scan(os.path.join(d, 'wait'))
@@ -583,6 +771,9 @@ class DesktopPet(QWidget):
         self.current_paths = self.wait_paths
         self.current_idx = 0
         self._hit_rect = self._calc_union_hit_rect()
+        # 预加载新角色的基础动画帧（后台异步，不阻塞 UI）
+        # 合并为一次调用，避免第二次调用取消第一次的后台任务
+        self._preload_paths(self.wait_paths + [p for p in self.click_paths if p not in self.wait_paths])
         if self.current_paths:
             self._show(self.current_paths[0])
         self.save_action_state()  # 切换角色后重置并持久化状态
@@ -591,12 +782,24 @@ class DesktopPet(QWidget):
         if always_on_top == self.always_on_top:
             return
         self.always_on_top = always_on_top
+
+        # 保存当前位置和尺寸
+        pos = self.pos()
+        size = self.size()
+
+        # 重建窗口标志
+        flags = Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint if always_on_top \
+            else Qt.FramelessWindowHint | Qt.Tool
+        # hide → setWindowFlags → show 是 Qt 文档推荐的强制窗口属性变更流程
         self.hide()
-        flags = Qt.FramelessWindowHint | Qt.Subwindow
-        if always_on_top:
-            flags |= Qt.WindowStaysOnTopHint
         self.setWindowFlags(flags)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+
+        # 恢复位置、尺寸并显示
+        self.resize(size)
+        self.move(pos)
         self.show()
+        self.activateWindow()
 
     # ── 鼠标 ────────────────────────────────
     def _calc_hit_rect(self, paths):
@@ -706,6 +909,7 @@ class DesktopPet(QWidget):
                 self._mode_switch_time = self._sit_switch_time  # 记录模式切换时间
                 if not self._sit_mode:
                     # 进入坐下模式：淡入sit
+                    self._preload_paths(self.sit_paths)  # 预加载 sit 帧
                     self._transition_phase = 4
                     self._sit_mode = True
                     self._moving = False
@@ -716,6 +920,7 @@ class DesktopPet(QWidget):
                     self._transition_phase = 5
                     self.save_action_state()  # 立即持久化
                     logger.debug('退出坐下模式')
+                self.trim_hot_frames()  # 坐下模式切换，清理非当前动画帧
             return
 
         if event.button() != Qt.LeftButton:
@@ -743,8 +948,12 @@ class DesktopPet(QWidget):
                 self.current_paths = self.pick_paths
                 self.current_idx = 0
         if self._drag:
-            self.move(self.pos() + d)
-            self._press = event.globalPos()
+            # 节流：最多 16ms 移动一次（60Hz），避免淹没窗口管理器
+            now = time.monotonic()
+            if now - self._last_move_time >= 0.016:
+                self._last_move_time = now
+                self.move(self.pos() + d)
+                self._press = event.globalPos()
 
     def mouseReleaseEvent(self, event):
         if event.button() != Qt.LeftButton:
@@ -771,6 +980,7 @@ class DesktopPet(QWidget):
         now = time.time()
         if now < self._cd_timer or not self.click_paths:
             return
+        self._preload_paths(self.click_paths)  # 确保 click 帧在内存中
         self._cd_timer = now + self.CLICK_CD
         self._mode_switch_time = now  # 记录模式切换时间
         # 保存当前 idle 帧作为淡入源
@@ -780,13 +990,34 @@ class DesktopPet(QWidget):
         self._transition_idx = 0
         self.timer.setInterval(self.CLICK_INTERVAL)
         self.save_action_state()  # 立即持久化 click 状态
+        self.trim_hot_frames()     # 点击模式切换，清理非当前动画帧
         logger.debug(f'点击动画触发，冷却 {self.CLICK_CD}s')
 
     def _save_pos(self):
-        cfg = load()
-        cfg['pos_x'] = self.x()
-        cfg['pos_y'] = self.y()
-        save(cfg)
+        """标记位置需要保存（防抖：1 秒内无新操作才真正写入）"""
+        self._pos_dirty = True
+        self._save_timer.start()
+
+    def _do_save(self):
+        """真正执行保存（由定时器触发，合并位置 + 动作状态）"""
+        try:
+            cfg = load()
+            changed = False
+            if self._pos_dirty:
+                cfg['pos_x'] = self.x()
+                cfg['pos_y'] = self.y()
+                self._pos_dirty = False
+                changed = True
+            if self._action_dirty:
+                action_type = self._get_action_type()
+                if cfg.get('action_type') != action_type:
+                    cfg['action_type'] = action_type
+                    changed = True
+                self._action_dirty = False
+            if changed:
+                save(cfg)
+        except Exception as e:
+            logger.error(f'延迟保存失败: {e}', exc_info=True)
 
     def _get_action_type(self) -> str:
         """获取当前动作类型（用于持久化）"""
@@ -800,16 +1031,9 @@ class DesktopPet(QWidget):
         return 'wait'
 
     def save_action_state(self):
-        """保存当前动作状态到配置文件"""
-        try:
-            cfg = load()
-            action_type = self._get_action_type()
-            if cfg.get('action_type') != action_type:
-                cfg['action_type'] = action_type
-                save(cfg)
-            logger.debug(f'保存动作状态: {action_type}')
-        except Exception as e:
-            logger.error(f'保存动作状态失败: {e}', exc_info=True)
+        """标记动作状态需要保存（防抖，与位置保存合并）"""
+        self._action_dirty = True
+        self._save_timer.start()
 
     def restore_action_state(self, action_type: str):
         """恢复上次的动作状态（启动时调用）"""
@@ -888,7 +1112,9 @@ class DesktopPet(QWidget):
             self._save_pos()
 
     def closeEvent(self, event):
-        """窗口关闭时保存位置 + 动作状态（合并为单次写入）"""
+        """窗口关闭时立即保存位置 + 动作状态（合并为单次写入）"""
+        # 停止防抖定时器，立即执行一次保存
+        self._save_timer.stop()
         try:
             cfg = load()
             cfg['pos_x'] = self.x()
@@ -902,15 +1128,95 @@ class DesktopPet(QWidget):
 
 
 # ─── 应用入口 ─────────────────────────────
+def _strip_qt_audio_plugins():
+    """删除 Qt 捆绑的音频/媒体插件，防止 WASAPI 独占模式抢占系统音频
+
+    仅删除 _MEIPASS（PyInstaller 临时解压目录）中的副本，
+    不影响 venv 或系统安装的原始文件。
+    我们的 app 不使用任何音频/媒体功能，删除这些插件零功能损失。
+    """
+    import shutil
+    meipass = getattr(sys, '_MEIPASS', None)
+    logger.info(f'_strip: frozen={getattr(sys, "frozen", False)}, '
+                f'_MEIPASS={meipass}')
+    if not meipass:
+        return
+    # 尝试所有可能的 Qt 插件路径（PyQt5 不同版本路径不同）
+    for rel in ('PyQt5/Qt5/plugins', 'PyQt5/Qt/plugins', 'PyQt5/plugins'):
+        plugins = os.path.join(meipass, rel)
+        if not os.path.isdir(plugins):
+            continue
+        logger.info(f'_strip: 找到插件目录 {plugins}')
+        for d in ('audio', 'mediaservice', 'texttospeech', 'webview'):
+            target = os.path.join(plugins, d)
+            if os.path.isdir(target):
+                try:
+                    shutil.rmtree(target)
+                    logger.info(f'_strip: 已移除音频插件 {d}/')
+                except OSError as e:
+                    logger.warning(f'_strip: 移除插件失败 {d}: {e}')
+
+
 def main():
+    # ── 修复打包后中文编码乱码 ────────────────────────────────
+    # PyInstaller 打包后 sys.stdout/stderr 默认使用系统编码（GBK），
+    # 导致所有中文输出乱码。强制使用 UTF-8。
+    if getattr(sys, 'frozen', False):
+        os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
+        try:
+            import io
+            if sys.stdout and sys.stdout.encoding.lower() != 'utf-8':
+                sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+            if sys.stderr and sys.stderr.encoding.lower() != 'utf-8':
+                sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+        except Exception:
+            pass
+
     try:
         logger.info('程序启动中...')
         _sync_auto_start()
         cfg = load()
         logger.info(f'配置加载成功: character={cfg.get("character")}, always_on_top={cfg.get("always_on_top")}')
 
+        # 强制 OpenGL 后端（必须在 QApplication 构造前设置）
+        # angle = ANGLE (DirectX 后备)，避免原生 OpenGL 驱动干扰音频子系统
+        os.environ['QT_OPENGL'] = os.environ.get('QT_OPENGL', 'angle')
+
+        # ── 音频隔离 ─────────────────────────────────────────
+        # Qt5 在 QApplication 创建时通过平台插件初始化音频子系统，
+        # 下列环境变量阻止其加载音频/媒体相关组件
+        os.environ.setdefault('QT_NO_AUDIO', '1')            # 禁用 Qt 音频后端
+        os.environ['QT_MULTIMEDIA_PREFERRED_PLUGINS'] = ''   # 不加载任何媒体插件
+        os.environ['QT_WEBENGINE_DISABLE_AUDIO'] = '1'       # 禁用 WebEngine 音频
+
+        # 打包模式：删除 _MEIPASS 中残留的音频插件 DLL
+        if getattr(sys, 'frozen', False):
+            _strip_qt_audio_plugins()
+
+        # Windows: 通知系统本进程不处理通信音频，防止自动降低其他应用音量
+        if sys.platform == 'win32':
+            try:
+                import ctypes
+                ctypes.windll.user32.SystemParametersInfoW(
+                    0x0058, 0, None, 0)  # SPI_SETBEEP=False
+            except Exception:
+                pass
+
         app = QApplication(sys.argv)
+        logger.info(f'音频隔离: QT_OPENGL={os.environ.get("QT_OPENGL")}, '
+                    f'QT_NO_AUDIO={os.environ.get("QT_NO_AUDIO")}, '
+                    f'QT_MULTIMEDIA={os.environ.get("QT_MULTIMEDIA_PREFERRED_PLUGINS")!r}')
         app.setQuitOnLastWindowClosed(False)
+
+        # 降低进程优先级，避免与游戏争抢 CPU
+        if sys.platform == 'win32':
+            try:
+                import ctypes
+                handle = ctypes.windll.kernel32.GetCurrentProcess()
+                ctypes.windll.kernel32.SetPriorityClass(handle, 0x00004000)  # BELOW_NORMAL
+                logger.info('进程优先级已设为 BELOW_NORMAL')
+            except Exception as e:
+                logger.warning(f'设置进程优先级失败: {e}')
 
         logo = os.path.join(CONFIG_DIR, 'logo.ico')
         if os.path.isfile(logo):

@@ -133,7 +133,18 @@ class Logger:
         file_handler.setLevel(logging.DEBUG)
 
         # 控制台 handler（开发模式）
-        console_handler = logging.StreamHandler()
+        # 打包后强制使用 UTF-8，避免 Windows 控制台 GBK 编码导致中文乱码
+        import io
+        if getattr(sys, 'frozen', False):
+            try:
+                console_stream = io.TextIOWrapper(
+                    sys.stdout.buffer, encoding='utf-8', errors='replace'
+                )
+            except Exception:
+                console_stream = sys.stdout
+        else:
+            console_stream = sys.stdout
+        console_handler = logging.StreamHandler(console_stream)
         console_handler.setLevel(logging.INFO)
 
         # 格式化器

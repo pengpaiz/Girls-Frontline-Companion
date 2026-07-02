@@ -137,44 +137,78 @@ class SettingsWindow(ctk.CTk):
         ))
 
     def _apply_auto_start(self):
-        """写入 / 删除 Windows 开机启动项（.vbs 脚本，完全静默）"""
+        """写入 / 删除 Windows 开机启动项
+
+        方案：VBS 静默脚本放 CONFIG_DIR，Startup 文件夹只放 .lnk 指向 VBS。
+        始终清理注册表旧条目，避免重复自启动。
+        """
         import platform
         if platform.system() != 'Windows':
             return
+        import winreg
+
+        REG_KEY = r'Software\Microsoft\Windows\CurrentVersion\Run'
+        REG_NAME = 'AuraPet'
 
         startup_dir = os.path.join(
             os.getenv('APPDATA', ''),
             r'Microsoft\Windows\Start Menu\Programs\Startup'
         )
-        vbs_path = os.path.join(startup_dir, 'AuraPet.vbs')
 
-        # 清理所有历史残留（.bat / .lnk）
-        for fname in ('AuraPet.bat', 'AuraPet.lnk'):
-            fp = os.path.join(startup_dir, fname)
+        # ── 1. 清理注册表旧条目（防止与快捷方式重复） ───────
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_KEY,
+                                 access=winreg.KEY_WRITE)
             try:
-                if os.path.isfile(fp):
-                    os.remove(fp)
-            except OSError:
+                winreg.DeleteValue(key, REG_NAME)
+            except FileNotFoundError:
                 pass
+            winreg.CloseKey(key)
+        except OSError:
+            pass
 
-        if self.cfg['auto_start']:
-            exe_path = self._get_exe_path()
-            # VBS 脚本：完全静默，无控制台窗口
-            vbs_content = (
-                'CreateObject("WScript.Shell").Run '
-                '"""{}""", 0, False'
-            ).format(exe_path)
+        # ── 2. 清理 Startup 文件夹内历史 VBS/bat 残留 ────────
+        if os.path.isdir(startup_dir):
+            for fname in os.listdir(startup_dir):
+                if fname.lower() in ('aurapet.vbs', 'aurapet.bat'):
+                    try:
+                        os.remove(os.path.join(startup_dir, fname))
+                    except OSError:
+                        pass
+
+        if not self.cfg['auto_start']:
+            # 关闭自启动：删除快捷方式
             try:
-                with open(vbs_path, 'w', encoding='utf-8') as f:
-                    f.write(vbs_content)
+                lnk = os.path.join(startup_dir, 'AuraPet.lnk')
+                if os.path.isfile(lnk):
+                    os.remove(lnk)
             except OSError:
                 pass
-        else:
-            try:
-                if os.path.isfile(vbs_path):
-                    os.remove(vbs_path)
-            except OSError:
-                pass
+            return
+
+        # ── 3. 在 CONFIG_DIR 写入 VBS 静默启动脚本 ────────
+        exe_path = os.path.abspath(self._get_exe_path())
+        vbs_path = os.path.join(CONFIG_DIR, 'AuraPet.vbs')
+        try:
+            with open(vbs_path, 'w', encoding='utf-8') as f:
+                f.write(
+                    'WScript.Sleep 5000\n'
+                    'CreateObject("WScript.Shell").Run """{}""", 0, False'.format(exe_path))
+        except OSError:
+            return
+
+        # ── 4. 在 Startup 文件夹创建指向 VBS 的快捷方式 ────
+        lnk_path = os.path.join(startup_dir, 'AuraPet.lnk')
+        try:
+            import win32com.client
+            shell = win32com.client.Dispatch('WScript.Shell')
+            sc = shell.CreateShortCut(lnk_path)
+            sc.TargetPath = vbs_path
+            sc.WorkingDirectory = CONFIG_DIR
+            sc.WindowStyle = 7  # 最小化启动 WScript
+            sc.save()
+        except Exception:
+            pass
 
     def _get_exe_path(self):
         if getattr(sys, 'frozen', False):
